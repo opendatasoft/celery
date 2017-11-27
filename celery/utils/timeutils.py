@@ -199,6 +199,9 @@ def remaining(start, ends_in, now=None, relative=False):
 
     """
     now = now or datetime.utcnow()
+    if now.utcoffset() != start.utcoffset():
+        # Timezone has changed, or DST started/ended
+        start = start.replace(tzinfo=now.tzinfo)
     end_date = start + ends_in
     if relative:
         end_date = delta_resolution(end_date, ends_in)
