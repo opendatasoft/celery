@@ -1,11 +1,14 @@
 """Schedules define the intervals at which periodic tasks run."""
 from __future__ import annotations
 
+from copy import copy
 import re
 from bisect import bisect, bisect_left
 from collections import namedtuple
-from datetime import datetime, timedelta, tzinfo
+from datetime import UTC, date, datetime, timedelta, tzinfo
 from typing import Any, Callable, Iterable, Mapping, Sequence, Union
+
+from dateutil.tz import datetime_ambiguous, resolve_imaginary
 
 from kombu.utils.objects import cached_property
 
@@ -14,7 +17,7 @@ from celery import Celery
 from . import current_app
 from .exceptions import ImproperlyConfigured
 from .utils.collections import AttributeDict
-from .utils.time import (_is_ambiguous, _is_imaginary, ffwd, humanize_seconds, localize, maybe_make_aware, maybe_timedelta, remaining, timezone,
+from .utils.time import (_is_imaginary, ffwd, humanize_seconds, localize, maybe_make_aware, maybe_timedelta, remaining, timezone,
                          weekday, yearmonth)
 
 __all__ = (
@@ -496,7 +499,6 @@ class crontab(BaseSchedule):
         Only called when ``day_of_month`` and/or ``month_of_year``
         cronspec is specified to further limit scheduled task execution.
         """
-        print("_delta_to_next", last_run_at.isoformat(), last_run_at.fold)
         datedata = AttributeDict(year=last_run_at.year)
         days_of_month = sorted(self.day_of_month)
         months_of_year = sorted(self.month_of_year)
@@ -578,6 +580,147 @@ class crontab(BaseSchedule):
         # the same form as they are stored by the superclass
         super().__init__(**state)
 
+
+    def _next_occurence(self, current: datetime):
+        # prepare an UTC timezoned datetime instance from the original date to ensure we have a continous time when adding days and hours
+        # _current_date = datetime(year=current.year, month=current.month, day=current.day, hour=current.hour, minute=current.minute, tzinfo=UTC)
+        tz: tzinfo = current.tzinfo
+        _current_date = current  # copy the date
+
+        print("crontab", self)
+        print("_next_occurence current", current)
+        print("_next_occurence _current_date at start", _current_date)
+
+        def _is_run_day(d: datetime):
+            """is the given date a good day to execute the task ?"""
+            print("_is_run_day", d)
+            result = d.month in self.month_of_year and d.day in self.day_of_month and d.isoweekday() % 7 in self.day_of_week
+            print("_is_run_day", result)
+            return result
+
+        def _is_run_time(d: datetime):
+            """is the time in given date a good time to execute the task ?"""
+            print("_is_run_time", d.isoformat())
+            print("_is_run_time hour", d.hour, self.hour)
+            print("_is_run_time minute", d.minute, self.minute)
+            return d.hour in self.hour and d.minute in self.minute
+
+        def _has_slots_that_hour(d: datetime):
+            return d.hour in self.hour and any(m for m in self.minute)
+
+        def _has_run_slots_that_day(d: datetime):
+            potential_hours = [h for h in self.hour]
+            if potential_hours:
+                print("_has_run_slots_that_day", d.isoformat())
+                before_resolve = d.replace(hour=min(potential_hours))
+                resolved_d = resolve_imaginary(d.replace(hour=min(potential_hours)))
+                print("_has_run_slots_that_day resolved", resolved_d.isoformat())
+                if before_resolve != resolved_d:
+                    potential_hours.remove(min(potential_hours))
+            print("_has_run_slots_that_day", potential_hours)
+            return bool(potential_hours)
+
+        def _run_slot_remains_that_day(d: datetime):
+            """check if there is another execution slots for that day (after d)"""
+            print("_run_slot_remains_that_day", d.isoformat())
+
+            potential_hours = [h for h in self.hour if h > d.hour - 1]
+            if potential_hours:
+                potentially_ambigous = d.replace(hour=min([h for h in self.hour if h > d.hour - 1]))
+                if d.fold == 1 or not datetime_ambiguous(potentially_ambigous):
+                    potential_hours = [h for h in self.hour if h > d.hour]
+
+                if potential_hours:
+                    print("_run_slot_remains_that_day", d.isoformat())
+                    before_resolve = d.replace(hour=min(potential_hours))
+                    after_resolve = resolve_imaginary(d.replace(hour=min(potential_hours)))
+                    print("_run_slot_remains_that_day resolved", after_resolve.isoformat())
+                    if before_resolve != after_resolve:
+                        potential_hours.remove(min(potential_hours))
+            _has_slot_that_hour = _run_slot_remains_that_hour(d)
+            _has_hour_slot_that_day = bool(potential_hours)
+
+            result = _has_slot_that_hour or _has_hour_slot_that_day
+            print("_run_slot_remains_that_day", result)
+            return result
+
+        def _run_slot_remains_that_hour(d: datetime):
+            """is the time in given date a good time to execute the task ?"""
+            print("_run_slot_remains_that_hour", d)
+            print("_run_slot_remains_that_hour hour", d.hour, self.hour)
+            print("_run_slot_remains_that_hour minute", d.minute, self.minute)
+            result = d.hour in self.hour and any(m for m in self.minute if m > d.minute)
+            print("_run_slot_remains_that_hour", result)
+            return result
+
+        def _get_next_run_day(d: datetime):
+            """returns the date for next execution, with hour and minute reset to 0."""
+            print("_get_next_run_day", d.isoformat())
+            d = (datetime(year=d.year, month=d.month, day=d.day) + timedelta(days=1)).replace(tzinfo=d.tzinfo)
+            cpt = 0
+            while not (_is_run_day(d) and _has_run_slots_that_day(d)):
+                d = (datetime(year=d.year, month=d.month, day=d.day) + timedelta(days=1)).replace(tzinfo=d.tzinfo)
+                if cpt > 2000:
+                    raise RuntimeError('unable to rollover, time specification is probably invalid')
+                cpt = cpt + 1
+            return d
+
+        def _get_next_run_hour(d: datetime):
+            """returns the date for next execution, with minute reset to 0."""
+            d = (d.astimezone(timezone.utc) + timedelta(hours=1)).astimezone(tz)
+            cpt = 0
+            print("_get_next_run_hour", d.hour, self.hour)
+            while d.hour not in self.hour:
+                d = (d.astimezone(timezone.utc) + timedelta(hours=1)).astimezone(tz)
+                print("_get_next_run_hour", d.hour, self.hour)
+                if cpt > 25:
+                    raise RuntimeError('unable to rollover, time specification is probably invalid')
+                cpt = cpt + 1
+            d = d.replace(minute=0)
+            return d
+
+        run_another_day = False
+        if not (_is_run_day(_current_date) and _run_slot_remains_that_day(_current_date)):
+            run_another_day = True
+            _current_date = _get_next_run_day(_current_date)
+
+        print("run_another_day", run_another_day, _current_date)
+        # if the task run another day, hour and minute have been reset
+        if not run_another_day:
+            # we did not reset the hour/minute
+            # print(_current_date.hour, self.hour)
+            if _current_date.hour in self.hour and _run_slot_remains_that_hour(_current_date):
+                # if there are slots this hour, add one minute so we get the next one later on
+                print(f"slots remain that hour", _current_date)
+                if _current_date.utcoffset() < (_current_date.astimezone(timezone.utc) + timedelta(minutes=1)).astimezone(tz).utcoffset():
+                    print("crossing the line (minutes)", _current_date, (_current_date.astimezone(timezone.utc) + timedelta(hours=1)).astimezone(tz))
+                _current_date = (_current_date.astimezone(timezone.utc) + timedelta(minutes=1)).astimezone(tz)
+            else:
+                print(f"no more slots remain that hour", _current_date)
+                # check if next hour would make us cross DST
+                if _current_date.utcoffset() < (_current_date.astimezone(timezone.utc) + timedelta(hours=1)).astimezone(tz).utcoffset():
+                    print("crossing the line (hours)", _current_date, (_current_date.astimezone(timezone.utc) + timedelta(hours=1)).astimezone(tz))
+                # if there are no more slots this hour, reset the minute and find a suitable hour to run
+                if _run_slot_remains_that_day(_current_date):
+                    _current_date = _get_next_run_hour(_current_date)
+
+            # we need to check again just in case we changed hour/day/month/year following these hours and minutes addition...
+            while not (_is_run_day(_current_date) and _has_run_slots_that_day(_current_date)):
+                _current_date = _get_next_run_day(_current_date)
+                _current_date = _get_next_run_hour(_current_date)
+
+        # todo use a better iteration
+        cpt = 0
+        while not _is_run_time(_current_date):
+            # assert we do not loop more than 60 times ?
+            if cpt > 60 * 24:
+                raise RuntimeError('final looking for a slot this hour', _current_date.isoformat())
+            cpt = cpt + 1
+            _current_date = (_current_date.astimezone(timezone.utc) + timedelta(minutes=1)).astimezone(tz)
+        print("_next_occurence", _current_date)
+        # switch to scheduled timezone before returning the datetime
+        return _current_date.replace(second=0, microsecond=0)
+
     def remaining_delta(self, last_run_at: datetime,
                         tz: str | tzinfo | None = None,
                         ffwd: type = ffwd) -> tuple[datetime, Any, datetime]:
@@ -587,88 +730,60 @@ class crontab(BaseSchedule):
         # crontab field matching and the next-run arithmetic below operate in
         # the frame the crontab is defined in. An aware last_run_at may arrive
         # in a different timezone (e.g. from django-celery-beat).
-        initial_last_run_at = self.maybe_make_aware(last_run_at).astimezone(schedule_tz)
         last_run_at = self.maybe_make_aware(last_run_at).astimezone(schedule_tz)
         now = self.maybe_make_aware(self.now()).astimezone(schedule_tz)
+        # dow_num = last_run_at.isoweekday() % 7  # Sunday is day 0, not day 7
 
-        print("remaining_delta last_run_at", last_run_at.isoformat())
-        print("remaining_delta now", now.isoformat())
-        print("remaining_delta now - last_run_at", now.astimezone(timezone.utc) - last_run_at.astimezone(timezone.utc))
+        # execute_this_date = (
+        #     last_run_at.month in self.month_of_year and
+        #     last_run_at.day in self.day_of_month and
+        #     dow_num in self.day_of_week
+        # )
 
-        if last_run_at.utcoffset() > now.utcoffset() and now.astimezone(timezone.utc) - last_run_at.astimezone(timezone.utc) <= timedelta(hours=1):
-            last_run_at = last_run_at - (last_run_at.utcoffset() - now.utcoffset())
+        # execute_this_hour = (
+        #     execute_this_date and
+        #     last_run_at.hour in self.hour and
+        #     last_run_at.minute < max(self.minute)
+        # )
 
-        print("remaining_delta last_run_at", last_run_at.isoformat())
+        # if execute_this_hour:
+        #     next_minute = min(minute for minute in self.minute
+        #                       if minute > last_run_at.minute)
+        #     delta = ffwd(minute=next_minute, second=0, microsecond=0)
+        # else:
+        #     next_minute = min(self.minute)
+        #     execute_today = (execute_this_date and
+        #                      last_run_at.hour < max(self.hour))
 
-        while True:
-            dow_num = last_run_at.isoweekday() % 7  # Sunday is day 0, not day 7
-            execute_today = False
-            execute_this_date = (
-                last_run_at.month in self.month_of_year and
-                last_run_at.day in self.day_of_month and
-                dow_num in self.day_of_week
-            )
-            print("execute_this_date", execute_this_date)
+        #     if execute_today:
+        #         next_hour = min(hour for hour in self.hour
+        #                         if hour > last_run_at.hour)
+        #         delta = ffwd(hour=next_hour, minute=next_minute,
+        #                      second=0, microsecond=0)
+        #     else:
+        #         next_hour = min(self.hour)
+        #         all_dom_moy = (self._orig_day_of_month == '*' and
+        #                        self._orig_month_of_year == '*')
+        #         if all_dom_moy:
+        #             next_day = min([day for day in self.day_of_week
+        #                             if day > dow_num] or self.day_of_week)
+        #             add_week = next_day == dow_num
 
-            execute_this_hour = (
-                execute_this_date and
-                last_run_at.hour in self.hour and
-                last_run_at.minute < max(self.minute)
-            )
-            print("execute_this_hour", execute_this_hour)
+        #             delta = ffwd(
+        #                 weeks=add_week and 1 or 0,
+        #                 weekday=(next_day - 1) % 7,
+        #                 hour=next_hour,
+        #                 minute=next_minute,
+        #                 second=0,
+        #                 microsecond=0,
+        #             )
+        #         else:
+        #             delta = self._delta_to_next(last_run_at,
+        #                                         next_hour, next_minute)
 
-            if execute_this_hour:
-                execute_today = True
-                next_minute = min(minute for minute in self.minute
-                                if minute > last_run_at.minute)
-                delta = ffwd(minute=next_minute, second=0, microsecond=0)
-            else:
-                next_minute = min(self.minute)
-                execute_today = (execute_this_date and
-                                last_run_at.hour < max(self.hour))
-
-                if execute_today:
-                    next_hour = min(hour for hour in self.hour
-                                    if hour > last_run_at.hour)
-                    print("execute_today", execute_today, next_hour, next_minute)
-                    delta = ffwd(hour=next_hour, minute=next_minute,
-                                second=0, microsecond=0)
-                else:
-                    next_hour = min(self.hour)
-                    print("not execute_today", execute_today, next_hour, next_minute)
-                    all_dom_moy = (self._orig_day_of_month == '*' and
-                                self._orig_month_of_year == '*')
-                    if all_dom_moy:
-                        next_day = min([day for day in self.day_of_week
-                                        if day > dow_num] or self.day_of_week)
-                        add_week = next_day == dow_num
-
-                        delta = ffwd(
-                            weeks=add_week and 1 or 0,
-                            weekday=(next_day - 1) % 7,
-                            hour=next_hour,
-                            minute=next_minute,
-                            second=0,
-                            microsecond=0,
-                        )
-                    else:
-                        delta = self._delta_to_next(last_run_at,
-                                                    next_hour, next_minute)
-
-            # verify next run date exist in the timezone
-            if not _is_imaginary(initial_last_run_at + delta, last_run_at.tzinfo):
-                print("existing date, get out")
-                break
-            print("not existing date, find a new one", (last_run_at + delta).isoformat())
-            # find next existing date
-            last_run_at = last_run_at + delta
-            while _is_imaginary(last_run_at, last_run_at.tzinfo):
-                # increase by one minute step until we are out of the non existing time
-                last_run_at = last_run_at + timedelta(minutes=1)
-            # and go back one minute so we get the next minute case
-            last_run_at = last_run_at + timedelta(minutes=-1)
-
-        return initial_last_run_at, delta, now
+        _next = self._next_occurence(last_run_at)
+        _delta = ffwd(year=_next.year, month=_next.month, day=_next.day, hour=_next.hour, minute=_next.minute, second=0, microsecond=0)
+        return last_run_at, _delta, now
 
     def remaining_estimate(
             self, last_run_at: datetime, ffwd: type = ffwd) -> timedelta:
@@ -679,49 +794,14 @@ class crontab(BaseSchedule):
         """
         # pylint: disable=redefined-outer-name
         # caching global ffwd
-        last_run_at, delta, now = self.remaining_delta(last_run_at, ffwd=ffwd)
+        schedule_tz: tzinfo = timezone.get_timezone(self.tz)
+        last_run_at = self.maybe_make_aware(last_run_at).astimezone(schedule_tz)
+        now = self.maybe_make_aware(self.now()).astimezone(schedule_tz)
 
-        last_run_at_no_tz = last_run_at.replace(tzinfo=None)
-        now_no_tz = now.replace(tzinfo=None)
-
-        print("remaining_estimate last_run_at.fold", last_run_at.fold)
-        print("remaining_estimate now.fold", now.fold)
-
-        # recreate due date but hack through the ffwd model to apply the "correct" fold value to the generated date
-        due_at = datetime(
-            year=delta.year if delta.year is not None else last_run_at.year,
-            month=delta.month if delta.month is not None else last_run_at.month,
-            day=delta.day if delta.day is not None else last_run_at.day,
-            hour=delta.hour if delta.hour is not None else last_run_at.hour,
-            minute=delta.minute,
-            fold=last_run_at.fold or now.fold,
-            tzinfo=last_run_at.tzinfo,
-        )
-        print("remaining_estimate due_at", due_at.isoformat())
-        due_at = due_at.astimezone(timezone.utc)
-        if delta.weeks is not None:
-            due_at += timedelta(days=delta.weeks * 7)
-        if delta.weekday is not None:
-            due_at += timedelta(days=(7 - last_run_at.weekday() + delta.weekday) % 7)
-        due_at = due_at.astimezone(last_run_at.tzinfo)
-        due_at = due_at.replace(hour=delta.hour if delta.hour is not None else last_run_at.hour)
-
-        due_at_no_tz = due_at.replace(tzinfo=None)
-
-        diff: timedelta = (last_run_at_no_tz + delta) - now_no_tz
-        diff: timedelta = due_at.astimezone(timezone.utc) - now.astimezone(timezone.utc)
-
-        print("remaining_estimate delta", delta)
-        print("remaining_estimate due_at", due_at.isoformat())
-        print("remaining_estimate last_run_at no tz", last_run_at_no_tz.isoformat())
-        print("remaining_estimate now no tz", now_no_tz.isoformat())
-        print("remaining_estimate due_at no tz", due_at_no_tz.isoformat())
-        print("remaining_estimate last_run_at utcoffset", (last_run_at).utcoffset())
-        print("remaining_estimate due_at utcoffset", due_at.utcoffset())
-        print("remaining_estimate now utcoffset", now.utcoffset())
-        print("remaining_estimate diff", diff)
-
-        return diff
+        next_run_at = self._next_occurence(last_run_at)
+        print("remaining_estimate", last_run_at.isoformat())
+        print("remaining_estimate", next_run_at.isoformat())
+        return next_run_at.astimezone(UTC) - now.astimezone(UTC)
 
     def is_due(self, last_run_at: datetime) -> tuple[bool, datetime]:
         """Return tuple of ``(is_due, next_time_to_run)``.
@@ -738,21 +818,9 @@ class crontab(BaseSchedule):
             :meth:`celery.schedules.schedule.is_due` for more information.
         """
 
-        now = self.maybe_make_aware(self.now()).astimezone(timezone.get_timezone(self.tz))
-
         rem_delta = self.remaining_estimate(last_run_at)
-        # last_offset = last_run_at.astimezone(timezone.get_timezone(self.tz)).utcoffset() or timedelta()
-        # now_offset = now.utcoffset() or timedelta()
-        # dst_diff = timedelta()
-        # if last_offset < now_offset:
-        #     # dst_diff = (last_offset - now_offset)
-        #     print("last_offset < now_offset")
-        # if last_offset > now_offset:
-        #     print("last_offset > now_offset")
-        #     dst_diff = (last_offset - now_offset)
-        # rem_delta = self.remaining_estimate(last_run_at - dst_diff)
         rem_secs = rem_delta.total_seconds()
-        print("is_due", rem_secs)
+        print("is_due", rem_delta, rem_secs)
         rem = max(rem_secs, 0)
         due = rem == 0
 
@@ -771,9 +839,7 @@ class crontab(BaseSchedule):
                 due = False
 
         if due or has_passed_deadline:
-            print("due, get next", due, rem)
             rem_delta = self.remaining_estimate(self.now())
-            # rem = max(rem_delta.total_seconds() + (dst_diff.total_seconds() if rem_delta.total_seconds() < 0 else 0), 0)
             rem = max(rem_delta.total_seconds(), 0)
         return schedstate(due, rem)
 
